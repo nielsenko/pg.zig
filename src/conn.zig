@@ -555,6 +555,9 @@ pub const Conn = struct {
                 'Z' => return affected,
                 'T' => affected = 0,
                 'D' => affected = (affected orelse 0) + 1,
+                // EmptyQueryResponse, the answer to a string with no
+                // statement in it
+                'I' => {},
                 else => return self.unexpectedDBMessage(),
             }
         }
@@ -602,7 +605,7 @@ pub const Conn = struct {
             };
             switch (msg.type) {
                 'Z' => return,
-                'C', 'T', 'D', 'n' => {},
+                'C', 'T', 'D', 'n', 'I' => {},
                 else => return self.unexpectedDBMessage(),
             }
         }
@@ -1993,6 +1996,23 @@ test "Stmt: as many parameters as the protocol counts" {
     try t.expectEqual(count, try row.get(i64, 0));
     try t.expectEqual(count / 2, try row.get(i64, 1));
     try result.drain();
+}
+
+test "Conn: a string with no statement in it" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+
+    for ([_][]const u8{ "", ";", "-- nothing" }) |sql| {
+        try t.expectEqual(null, try c.exec(sql, .{}));
+
+        var result = try c.query(sql, .{});
+        defer result.deinit();
+        try t.expectEqual(0, result.number_of_columns);
+        try t.expectEqual(null, try result.next());
+    }
+
+    // the connection is good for the next one
+    try t.expectEqual(2, t.scalar(&c, "select 2"));
 }
 
 test "Conn: auth_methods" {

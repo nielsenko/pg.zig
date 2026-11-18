@@ -66,6 +66,7 @@ pub const Result = struct {
             switch (msg.type) {
                 'C' => {}, // CommandComplete
                 'D' => {}, // DataRow
+                'I' => {}, // EmptyQueryResponse
                 'Z' => return,
                 else => return error.UnexpectedDBMessage,
             }
@@ -135,7 +136,9 @@ pub const Result = struct {
                     ._result = self,
                 };
             },
-            'C' => {
+            // CommandComplete, or EmptyQueryResponse in its place for a
+            // string with no statement in it
+            'C', 'I' => {
                 try self._conn.readyForQuery();
                 return null;
             },
