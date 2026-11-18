@@ -59,6 +59,17 @@ pub const Conn = struct {
     // cache_name => data necessary to re-execute previously prepared statement.
     _prepared_statements: std.hash_map.StringHashMapUnmanaged(Stmt.Describe),
 
+    // The statements queue() holds for the next write: a Parse, a Bind and an
+    // Execute for each, and no Sync.
+    _queued: std.ArrayList(u8) = .empty,
+
+    // How many statements _queued holds.
+    _queued_count: u16 = 0,
+
+    // How many statements from the queue have gone out and not been answered
+    // yet. read() passes over their answers.
+    _queued_answers: u16 = 0,
+
     const State = enum {
         idle,
 
@@ -209,6 +220,7 @@ pub const Conn = struct {
         }
         self._buf.deinit();
         self._reader.deinit();
+        self._queued.deinit(allocator);
         allocator.free(self._param_oids);
         self._result_state.deinit(allocator);
 
@@ -228,7 +240,64 @@ pub const Conn = struct {
             return;
         };
         self.err = null;
+        // What was queued and never sent is not the next caller's to send.
+        _ = self.unqueue();
         pool.release(self);
+    }
+
+    // Holds `sql` back to go out with the next statement, in the same write,
+    // and sends nothing now. The server runs it just before that statement,
+    // so the two cost one round trip. A `begin` is what this is for.
+    //
+    // `sql` takes no parameters, and rows it returns are dropped. When it
+    // fails, the server doesn't run the statement it went out with, and that
+    // statement returns the error.
+    //
+    // A statement in the simple protocol, which exec() uses when it's given
+    // no values, can't share a round trip this way. It sends what is queued
+    // on its own first.
+    pub fn queue(self: *Conn, sql: []const u8) !void {
+        const allocator = self._allocator;
+        var queued = &self._queued;
+
+        const parse_len = 4 + 1 + sql.len + 1 + 2;
+        try queued.ensureUnusedCapacity(allocator, 1 + parse_len + 13 + 10);
+
+        // PARSE: the unnamed statement, the sql, and no parameter types
+        queued.appendAssumeCapacity('P');
+        std.mem.writeInt(u32, queued.addManyAsArrayAssumeCapacity(4), @intCast(parse_len), .big);
+        queued.appendAssumeCapacity(0);
+        queued.appendSliceAssumeCapacity(sql);
+        queued.appendSliceAssumeCapacity(&.{ 0, 0, 0 });
+
+        queued.appendSliceAssumeCapacity(&.{
+            // BIND: the unnamed portal to the unnamed statement, with no
+            // parameter formats, no parameters and no result formats
+            'B', 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0,
+            // EXECUTE: the unnamed portal, with no row limit
+            'E', 0, 0, 0, 9,  0, 0, 0, 0, 0,
+        });
+        self._queued_count += 1;
+    }
+
+    // Drops what queue() holds and has not sent. Returns whether there was
+    // anything.
+    pub fn unqueue(self: *Conn) bool {
+        if (self._queued_count == 0) return false;
+        self._queued.clearRetainingCapacity();
+        self._queued_count = 0;
+        return true;
+    }
+
+    // Sends what queue() holds with a Sync of its own, and reads its answers.
+    fn flushQueued(self: *Conn) !void {
+        if (self._queued_count == 0) return;
+        try self.write(&.{ 'S', 0, 0, 0, 4 });
+        const msg = self.read() catch |err| {
+            if (err == error.PG) try self.recoverFromError();
+            return err;
+        };
+        if (msg.type != 'Z') return self.unexpectedDBMessage();
     }
 
     pub fn auth(self: *Conn, opts: AuthOpts) !void {
@@ -521,6 +590,9 @@ pub const Conn = struct {
         if (values.len == 0) {
             try self._reader.startFlow(opts.allocator, opts.timeout);
             defer self._reader.endFlow();
+            // If a queued statement failed, the server would pass over a
+            // Query that follows it and never answer. So the queue goes first.
+            try self.flushQueued();
             const simple_query = proto.Query{ .sql = sql };
             try simple_query.write(buf);
             // no longer idle, we're now in a query
@@ -590,6 +662,9 @@ pub const Conn = struct {
     }
 
     pub fn execIgnoringState(self: *Conn, sql: []const u8) !void {
+        // The same as in execOpts. Whatever the queue ends in, sql goes out.
+        self.flushQueued() catch {};
+
         var buf = &self._buf;
         buf.reset();
 
@@ -654,14 +729,54 @@ pub const Conn = struct {
                 },
                 'S' => {}, // TODO: ParameterStatus,
                 'N' => {}, // TODO: NoticeResponse
-                'E' => return self.setErr(msg.data),
-                else => return msg,
+                'E' => {
+                    // After an error the server passes over everything up to
+                    // the next Sync, which includes the rest of the queue.
+                    self._queued_answers = 0;
+                    return self.setErr(msg.data);
+                },
+                else => {
+                    if (self._queued_answers == 0) return msg;
+                    // The answer of a queued statement: ParseComplete,
+                    // BindComplete, rows we drop, and CommandComplete or
+                    // EmptyQueryResponse to end it.
+                    switch (msg.type) {
+                        '1', '2', 'D' => {},
+                        'C', 'I' => self._queued_answers -= 1,
+                        else => return self.unexpectedDBMessage(),
+                    }
+                },
             }
         }
     }
 
     pub fn write(self: *Conn, data: []const u8) !void {
+        if (self._queued_count > 0) return self.writeWithQueued(data);
         self._stream.writeAll(data) catch |err| {
+            self._state = .fail;
+            return err;
+        };
+    }
+
+    // write(), with what queue() holds ahead of `data`.
+    fn writeWithQueued(self: *Conn, data: []const u8) !void {
+        var queued = &self._queued;
+        defer queued.clearRetainingCapacity();
+        self._queued_answers += self._queued_count;
+        self._queued_count = 0;
+
+        // A write is a packet, so the two go in one where copying `data` is
+        // cheap.
+        const one_write = data.len <= 16 * 1024;
+        if (one_write) queued.appendSlice(self._allocator, data) catch |err| {
+            self._state = .fail;
+            return err;
+        };
+        self._stream.writeAll(queued.items) catch |err| {
+            self._state = .fail;
+            return err;
+        };
+        if (!one_write) self._stream.writeAll(data) catch |err| {
             self._state = .fail;
             return err;
         };
@@ -2013,6 +2128,95 @@ test "Conn: a string with no statement in it" {
 
     // the connection is good for the next one
     try t.expectEqual(2, t.scalar(&c, "select 2"));
+}
+
+test "Conn: a queued statement goes out with the next one" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+    _ = try c.exec("create temp table queued (n int4)", .{});
+
+    // A begin that rides with an insert, which a rollback then takes back.
+    // The same statement three ways: described, then cached, then from the
+    // cache.
+    for ([_]?[]const u8{ null, "queued_insert", "queued_insert" }) |cache_name| {
+        try c.queue("begin");
+        try t.expectEqual(Conn.State.idle, c._state);
+        try t.expectEqual(1, try c.execOpts("insert into queued values ($1)", .{1}, .{ .cache_name = cache_name }));
+        try t.expectEqual(Conn.State.transaction, c._state);
+        try c.rollback();
+        try t.expectEqual(0, t.scalar(&c, "select count(*)::int4 from queued"));
+    }
+
+    // With a statement that isn't described first.
+    try c.queue("begin");
+    {
+        var result = try c.query("select 41 + 1", .{});
+        defer result.deinit();
+        try t.expectEqual(42, try (try result.next()).?.get(i32, 0));
+        try result.drain();
+    }
+    try t.expectEqual(Conn.State.transaction, c._state);
+    try c.rollback();
+
+    // Several, one of them with rows that are dropped.
+    try c.queue("begin");
+    try c.queue("select n from generate_series(1, 3) n");
+    try c.queue("set local application_name = 'queued'");
+    {
+        var result = try c.query("select current_setting('application_name') where $1", .{true});
+        defer result.deinit();
+        try t.expectString("queued", try (try result.next()).?.get([]const u8, 0));
+        try result.drain();
+    }
+    try c.rollback();
+}
+
+test "Conn: a queued statement that fails takes the next one with it" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+    _ = try c.exec("create temp table queued (n int4)", .{});
+
+    for ([_]?[]const u8{ null, "queued_insert", "queued_insert" }) |cache_name| {
+        try c.queue("select 1/0");
+        try c.queue("select 2");
+        try t.expectError(error.PG, c.execOpts("insert into queued values ($1)", .{1}, .{ .cache_name = cache_name }));
+        try t.expectString("22012", c.err.?.code);
+        // The insert did not run, and the connection takes the next one.
+        try t.expectEqual(0, t.scalar(&c, "select count(*)::int4 from queued"));
+    }
+
+    try c.queue("select 1/0");
+    try t.expectError(error.PG, c.query("select 1", .{}));
+    try t.expectEqual(2, t.scalar(&c, "select 2"));
+}
+
+test "Conn: a queue ahead of the simple protocol, and one that's dropped" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+    _ = try c.exec("create temp table queued (n int4)", .{});
+
+    // exec without values is a Query, which the queue goes ahead of on its own.
+    try c.queue("begin");
+    _ = try c.exec("insert into queued values (1)", .{});
+    try t.expectEqual(Conn.State.transaction, c._state);
+    try c.rollback();
+    try t.expectEqual(0, t.scalar(&c, "select count(*)::int4 from queued"));
+
+    try c.queue("select 1/0");
+    try t.expectError(error.PG, c.exec("insert into queued values (1)", .{}));
+    try t.expectEqual(0, t.scalar(&c, "select count(*)::int4 from queued"));
+
+    // A rollback sends what is queued first, and ends what that began.
+    try c.queue("begin");
+    try c.rollback();
+    try t.expectEqual(Conn.State.idle, c._state);
+
+    try c.queue("begin");
+    try t.expectEqual(true, c.unqueue());
+    try t.expectEqual(false, c.unqueue());
+    _ = try c.exec("insert into queued values ($1)", .{2});
+    try t.expectEqual(Conn.State.idle, c._state);
+    try t.expectEqual(1, t.scalar(&c, "select count(*)::int4 from queued"));
 }
 
 test "Conn: auth_methods" {

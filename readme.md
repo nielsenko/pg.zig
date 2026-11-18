@@ -187,6 +187,23 @@ Calls `_ = try execOpts("commit", .{}, .{})`
 ### rollback() !void
 Calls `_ = try execOpts("rollback", .{}, .{})`
 
+### queue(sql: []const u8) !void
+Holds `sql` back to go out with the next statement, in the same write, and sends nothing now. The server runs it just before that statement, so the two cost one round trip:
+
+```zig
+try conn.queue("begin");
+// one round trip for the begin and the insert
+_ = try conn.exec("insert into users (name) values ($1)", .{"Leto"});
+try conn.commit();
+```
+
+`sql` takes no parameters, and rows it returns are dropped. When it fails, the server does not run the statement it went out with, and that statement returns the error. Several statements can be queued.
+
+A statement in the simple protocol, which `exec` uses when it is given no values, and a `rollback` send what is queued on its own first.
+
+### unqueue() bool
+Drops what `queue` holds and has not sent. Returns whether there was anything, which is whether no statement has gone out since.
+
 ## Result
 The `conn.query` and `conn.queryOpts` methods return a `pg.Result` which is used to read rows and values.
 
