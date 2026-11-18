@@ -48,6 +48,14 @@ pub const Stmt = struct {
     // by the server
     name: []const u8,
 
+    // Where the Bind message starts in buf. 0, unless prepareUndescribed put
+    // a Parse message ahead of it.
+    bind_start: usize = 0,
+
+    // False after prepareUndescribed until execute() has read the description
+    // of the result, which the server then sends along with the result.
+    described: bool = true,
+
     pub fn init(conn: *Conn, opts: Conn.QueryOpts) !Stmt {
         const base_allocator = opts.allocator orelse conn._allocator;
         const arena = try base_allocator.create(ArenaAllocator);
@@ -101,6 +109,14 @@ pub const Stmt = struct {
     // When describe_allocator != null, we intend to cache the query information
     // (in conn.__prepared_statements).
     pub fn prepare(self: *Stmt, sql: []const u8, describe_allocator: ?Allocator) !void {
+        if (self.opts.param_oids) |param_oids| {
+            // What we cache is the description, so a statement that's to be
+            // cached still gets one.
+            if (describe_allocator == null and self.name.len == 0) {
+                return self.prepareUndescribed(sql, param_oids);
+            }
+        }
+
         var conn = self.conn;
         const opts = &self.opts;
         const statement_arena = self.arena.allocator();
@@ -210,54 +226,105 @@ pub const Stmt = struct {
             self.param_count = param_count;
         }
 
-        {
-            // We now expect an answer to our describe message.
-            // This is either going to be a RowDescription, or a NoData. NoData means
-            // our statement doesn't return any data. Either way, we're going to use
-            // this information when we generate our Bind message, next.
-            const msg = try conn.read();
-            switch (msg.type) {
-                'n' => {}, // no data, column_count = 0
-                'T' => {
-                    var state = self.result_state;
-                    const data = msg.data;
-                    if (data.len < 2) {
-                        return conn.unexpectedDBMessage();
-                    }
-                    const column_count = std.mem.readInt(u16, data[0..2], .big);
-                    if (describe_allocator) |da| {
-                        // If we plan on caching this prepared statement, then we need
-                        // to allocate a new param_oids list which will outlive this
-                        // statement
-                        state = try Result.State.init(da, column_count);
-                        self.result_state = state;
-                    } else if (column_count > state.oids.len) {
-                        lib.metrics.allocColumns(column_count);
-                        // we have more columns than our self._result_state can handle, we
-                        // need to create a new Result.State specifically for this
-                        state = try Result.State.init(statement_arena, column_count);
-                        self.result_state = state;
-                    }
-                    const a: ?Allocator = if (opts.column_names) (describe_allocator orelse statement_arena) else null;
-                    try state.from(column_count, data, a);
-                    self.column_count = column_count;
-                },
-                else => return conn.unexpectedDBMessage(),
-            }
-        }
+        // We now expect an answer to our describe message. We're going to use
+        // this information when we generate our Bind message, next.
+        try self.readRowDescription(try conn.read(), describe_allocator);
 
         // Consume the ReadyForQuery from our Sync
         try conn.readyForQuery();
         return self.prepareForBind(param_count);
     }
 
+    // The answer to a Describe is either a RowDescription, or a NoData. NoData
+    // means our statement doesn't return any data.
+    fn readRowDescription(self: *Stmt, msg: lib.Message, describe_allocator: ?Allocator) !void {
+        const conn = self.conn;
+        switch (msg.type) {
+            'n' => {}, // no data, column_count = 0
+            'T' => {
+                var state = self.result_state;
+                const data = msg.data;
+                if (data.len < 2) {
+                    return conn.unexpectedDBMessage();
+                }
+                const column_count = std.mem.readInt(u16, data[0..2], .big);
+                if (describe_allocator) |da| {
+                    // If we plan on caching this prepared statement, then we need
+                    // to allocate a new param_oids list which will outlive this
+                    // statement
+                    state = try Result.State.init(da, column_count);
+                    self.result_state = state;
+                } else if (column_count > state.oids.len) {
+                    lib.metrics.allocColumns(column_count);
+                    // we have more columns than our self._result_state can handle, we
+                    // need to create a new Result.State specifically for this
+                    state = try Result.State.init(self.arena.allocator(), column_count);
+                    self.result_state = state;
+                }
+                const a: ?Allocator = if (self.opts.column_names) (describe_allocator orelse self.arena.allocator()) else null;
+                try state.from(column_count, data, a);
+                self.column_count = column_count;
+            },
+            else => return conn.unexpectedDBMessage(),
+        }
+    }
+
+    // prepare() normally asks the server to describe the statement, and
+    // execute() can't go out until the answer is in: that's two round trips.
+    // This asks nothing first. It queues the Parse, and execute() sends it
+    // together with Bind, Describe, Execute and Sync, which is one round trip.
+    //
+    // What we give up is the server telling us the type of each parameter,
+    // which bind() goes by. So the caller says, in opts.param_oids.
+    fn prepareUndescribed(self: *Stmt, sql: []const u8, param_oids: []const i32) !void {
+        lib.assert(self.name.len == 0);
+
+        const conn = self.conn;
+        const statement_arena = self.arena.allocator();
+        try conn._reader.startFlow(statement_arena, self.opts.timeout);
+
+        var buf = self.buf;
+        buf.reset();
+
+        const param_count: u16 = @intCast(param_oids.len);
+
+        // PARSE: an unnamed statement, the sql, and the type of each parameter
+        const parse_payload_len = 4 + 1 + sql.len + 1 + 2 + 4 * param_oids.len;
+        try buf.ensureTotalCapacity(1 + parse_payload_len);
+        var view = buf.skip(1 + parse_payload_len) catch unreachable;
+        view.writeByte('P');
+        view.writeIntBig(u32, @intCast(parse_payload_len));
+        view.writeByte(0);
+        view.write(sql);
+        view.writeByte(0);
+        view.writeIntBig(u16, param_count);
+        for (param_oids) |oid| {
+            view.writeIntBig(i32, oid);
+        }
+
+        if (param_count > self.param_oids.len) {
+            lib.metrics.allocParams(param_count);
+            self.param_oids = try statement_arena.alloc(i32, param_count);
+        }
+        @memcpy(self.param_oids[0..param_count], param_oids);
+        self.param_count = param_count;
+
+        self.described = false;
+        self.bind_start = buf.len();
+        return self.startBind(param_count);
+    }
+
     // We need to call Bind for every value we're binding. Rather than having
     // to check "is this the first call to bind" each time, we make it the caller's
     // responsibility to "prepareForBind" upfront.
     pub fn prepareForBind(self: *Stmt, param_count: u16) !void {
-        var buf = self.buf;
-        buf.resetRetainingCapacity();
+        self.buf.resetRetainingCapacity();
+        return self.startBind(param_count);
+    }
 
+    // Appends the start of the Bind message to whatever buf already holds.
+    fn startBind(self: *Stmt, param_count: u16) !void {
+        var buf = self.buf;
         const name = self.name;
 
         // Bind command = 'B'
@@ -293,7 +360,7 @@ pub const Stmt = struct {
         // We tell PostgreSQL the format (text or binary) of each parameter. This
         // information is at the start of the message, always starts at byte 9
         // and each value is 2 bytes.
-        const format_offset = 9 + (param_index * 2) + name.len;
+        const format_offset = self.bind_start + 9 + (param_index * 2) + name.len;
 
         try types.bindValue(@TypeOf(value), self.param_oids[param_index], value, self.buf, format_offset);
         self.param_index = param_index + 1;
@@ -308,15 +375,30 @@ pub const Stmt = struct {
         const buf = self.buf;
         const conn = self.conn;
 
+        const described = self.described;
+
         // The last part of the bind message is telling PostgreSQL the format we
         // want to receive the result columns in.
-        try lib.types.resultEncoding(self.result_state.oids[0..self.column_count], buf);
+        if (described) {
+            try lib.types.resultEncoding(self.result_state.oids[0..self.column_count], buf);
+        } else {
+            // We don't know the columns yet, and one format applies to all of
+            // them. Binary is what resultEncoding picks for every type but
+            // text, whose binary form is its text.
+            try buf.write(&.{ 0, 1, 0, 1 });
+        }
 
-        // write the full payload length, which always starts at byte 1 (after
-        // the 'B' message type)
+        // write the full payload length, which starts 1 byte into the message
+        // (after the 'B' message type)
         // Reaching directly into buf.buf is bad!
         // -1 because the length doesn't include the 'B'
-        std.mem.writeInt(u32, buf.buf[1..5], @intCast(buf.len() - 1), .big);
+        const bind_start = self.bind_start;
+        std.mem.writeInt(u32, buf.buf[bind_start + 1 ..][0..4], @intCast(buf.len() - bind_start - 1), .big);
+
+        if (described == false) {
+            // Describe the portal that our Bind creates
+            try buf.write(&.{ 'D', 0, 0, 0, 6, 'P', 0 });
+        }
 
         try buf.write(&.{
             'E',
@@ -343,15 +425,47 @@ pub const Stmt = struct {
 
         try conn.write(buf.string());
 
-        {
+        if (described == false) {
+            // no longer idle, we're now in a query
+            conn._state = .query;
+
+            // If Parse fails, the server skips the rest of our messages and
+            // sends a ReadyForQuery.
             const msg = conn.read() catch |err| {
                 if (err == error.PG) try conn.recoverFromError();
+                return err;
+            };
+            if (msg.type != '1') {
+                // expecting a ParseComplete
+                return conn.unexpectedDBMessage();
+            }
+        }
+
+        {
+            const msg = conn.read() catch |err| {
+                if (err == error.PG) {
+                    try conn.recoverFromError();
+                    // prepare() would have known the number of parameters, and
+                    // this would have been caught before anything was sent
+                    if (described == false and conn.err != null and std.mem.eql(u8, conn.err.?.code, "08P01")) {
+                        return error.WrongNumberOfParameters;
+                    }
+                }
                 return err;
             };
             if (msg.type != '2') {
                 // expecting a BindComplete
                 return conn.unexpectedDBMessage();
             }
+        }
+
+        if (described == false) {
+            const msg = conn.read() catch |err| {
+                if (err == error.PG) try conn.recoverFromError();
+                return err;
+            };
+            try self.readRowDescription(msg, null);
+            self.described = true;
         }
 
         try conn.peekForError();

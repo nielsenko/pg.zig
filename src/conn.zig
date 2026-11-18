@@ -135,6 +135,17 @@ pub const Conn = struct {
         // When not null, the prepared statement will be cached and re-used
         // by subsequent queries using the same name.
         cache_name: ?[]const u8 = null,
+
+        // The type of each parameter, as an OID, or 0 to have the server
+        // infer it. When not null, the statement isn't described before it's
+        // run, which saves a round trip. The price is that the server no
+        // longer tells us what it expects, so nothing is coerced: each value
+        // must be one that its declared type takes, and for 0, text
+        // ([]const u8) or a pg.Binary.
+        //
+        // A statement without parameters is always run this way. Ignored
+        // when cache_name is set, since what we cache is the description.
+        param_oids: ?[]const i32 = null,
     };
 
     pub fn openAndAuthUri(io: Io, allocator: Allocator, uri: std.Uri) !Conn {
@@ -428,6 +439,11 @@ pub const Conn = struct {
                     .result_state = stmt.result_state,
                 });
             } else {
+                if (values.len == 0 and stmt.opts.param_oids == null) {
+                    // Nothing to bind, so there's nothing we need the server
+                    // to tell us before we run the statement.
+                    stmt.opts.param_oids = &.{};
+                }
                 try stmt.prepare(sql, null);
             }
         }
@@ -1842,6 +1858,107 @@ test "Conn: invalid DataRow from the server" {
     }
 }
 
+test "Conn: a query without parameters goes out in one round trip" {
+    const one_row = [_]u8{ 'D', 0, 0, 0, 14, 0, 1, 0, 0, 0, 4, 0, 0, 0, 7 };
+    const command_complete = [_]u8{ 'C', 0, 0, 0, 13 } ++ "SELECT 1".* ++ [_]u8{0};
+
+    var server = try FakeServer.start(&.{
+        &FakeServer.auth_ok,
+        &FakeServer.ready_for_query,
+        &FakeServer.describe_one_int,
+        &one_row,
+        &command_complete,
+        &FakeServer.ready_for_query,
+    });
+    {
+        var c = try Conn.open(t.io, t.allocator, .{ .host = "127.0.0.1", .port = server.port() });
+        defer c.deinit();
+        try c.auth(.{});
+
+        var result = try c.query("select a", .{});
+        defer result.deinit();
+        const row = (try result.next()).?;
+        try t.expectEqual(7, try row.get(i32, 0));
+        try t.expectEqual(null, try result.next());
+        try t.expectEqual(Conn.State.idle, c._state);
+    }
+    const received = try server.stop();
+
+    // Parse, Bind, a Describe of the portal, Execute and Sync, with nothing
+    // that waits for an answer in between: no Describe of the statement, and
+    // only the one Sync
+    const parse = [_]u8{ 'P', 0, 0, 0, 16, 0 } ++ "select a".* ++ [_]u8{ 0, 0, 0 };
+    const bind = [_]u8{ 'B', 0, 0, 0, 14, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1 };
+    const describe_portal = [_]u8{ 'D', 0, 0, 0, 6, 'P', 0 };
+    const execute = [_]u8{ 'E', 0, 0, 0, 9, 0, 0, 0, 0, 0 };
+    const sync = [_]u8{ 'S', 0, 0, 0, 4 };
+    const terminate = [_]u8{ 'X', 0, 0, 0, 4 };
+    try t.expectEqual(true, received.contains(&(parse ++ bind ++ describe_portal ++ execute ++ sync ++ terminate)));
+}
+
+test "Conn: param_oids with a declared and an inferred parameter" {
+    defer t.reset();
+
+    var c = try t.connect(.{});
+    defer c.deinit();
+
+    var result = try c.queryOpts("select $1 + 1 as n, $2 as s", .{ @as(i32, 41), "as text" }, .{
+        .column_names = true,
+        .param_oids = &.{ types.Int32.oid.decimal, 0 },
+    });
+    defer result.deinit();
+
+    try t.expectString("n", result.column_names[0]);
+    try t.expectString("s", result.column_names[1]);
+    const row = (try result.next()).?;
+    try t.expectEqual(42, try row.get(i32, 0));
+    try t.expectString("as text", try row.get([]const u8, 1));
+    try t.expectEqual(null, try result.next());
+
+    // the connection is good for the next one
+    try t.expectEqual(2, t.scalar(&c, "select 2"));
+}
+
+test "Conn: param_oids reports an error the server finds in the statement" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+
+    // at Parse
+    try t.expectError(error.PG, c.queryOpts("selct $1", .{"a"}, .{ .param_oids = &.{0} }));
+    try t.expectString("42601", c.err.?.code);
+
+    // at Bind, from a value the parameter's type can't take
+    try t.expectError(error.PG, c.queryOpts("select $1::int4", .{"not a number"}, .{ .param_oids = &.{0} }));
+    try t.expectString("22P02", c.err.?.code);
+
+    // as many types as values, checked before anything is sent
+    try t.expectError(error.WrongNumberOfParameters, c.queryOpts("select $1::int4", .{1}, .{ .param_oids = &.{} }));
+
+    // and no fewer than the statement has parameters, which the server checks
+    try t.expectError(error.WrongNumberOfParameters, c.queryOpts("select $1::int4 + $2::int4", .{1}, .{
+        .param_oids = &.{types.Int32.oid.decimal},
+    }));
+
+    // the connection is good for the next one
+    try t.expectEqual(2, t.scalar(&c, "select 2"));
+}
+
+test "Conn: param_oids is ignored for a cached statement" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+
+    for (0..2) |_| {
+        // an i64 for an int4 is what only a described statement coerces
+        var result = try c.queryOpts("select $1::int4 + 1", .{@as(i64, 41)}, .{
+            .cache_name = "param_oids_cached",
+            .param_oids = &.{0},
+        });
+        defer result.deinit();
+        try t.expectEqual(42, try (try result.next()).?.get(i32, 0));
+        try result.drain();
+    }
+}
+
 test "Conn: auth_methods" {
     const cleartext = [_]u8{ 'R', 0, 0, 0, 8, 0, 0, 0, 3 };
     const md5 = [_]u8{ 'R', 0, 0, 0, 12, 0, 0, 0, 5, 1, 2, 3, 4 };
@@ -1913,12 +2030,11 @@ const FakeServer = struct {
     const auth_ok = [_]u8{ 'R', 0, 0, 0, 8, 0, 0, 0, 0 };
     const ready_for_query = [_]u8{ 'Z', 0, 0, 0, 5, 'I' };
 
-    // describes a query with no parameters and one int4 column, "a", ready
+    // answers a query with no parameters and one int4 column, "a", ready
     // for its first DataRow
     const describe_one_int = [_]u8{ '1', 0, 0, 0, 4 } // ParseComplete
-        ++ [_]u8{ 't', 0, 0, 0, 6, 0, 0 } // ParameterDescription
-        ++ [_]u8{ 'T', 0, 0, 0, 26, 0, 1, 'a', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 23, 0, 4, 0xff, 0xff, 0xff, 0xff, 0, 1 } // RowDescription
-        ++ ready_for_query ++ [_]u8{ '2', 0, 0, 0, 4 }; // BindComplete
+        ++ [_]u8{ '2', 0, 0, 0, 4 } // BindComplete
+        ++ [_]u8{ 'T', 0, 0, 0, 26, 0, 1, 'a', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 23, 0, 4, 0xff, 0xff, 0xff, 0xff, 0, 1 }; // RowDescription
 
     fn start(messages: []const []const u8) !FakeServer {
         const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
