@@ -109,11 +109,13 @@ pub const Stmt = struct {
     // When describe_allocator != null, we intend to cache the query information
     // (in conn.__prepared_statements).
     pub fn prepare(self: *Stmt, sql: []const u8, describe_allocator: ?Allocator) !void {
-        if (self.opts.param_oids) |param_oids| {
+        // The types the caller declares, which go in the Parse either way.
+        const declared: []const i32 = self.opts.param_oids orelse &.{};
+        if (self.opts.param_oids != null) {
             // What we cache is the description, so a statement that's to be
             // cached still gets one.
             if (describe_allocator == null and self.name.len == 0) {
-                return self.prepareUndescribed(sql, param_oids);
+                return self.prepareUndescribed(sql, declared);
             }
         }
 
@@ -139,7 +141,7 @@ pub const Stmt = struct {
             // We can calculate exactly how many bytes our 3 messages are going to be
             // and make sure our buffer is big enough, thus avoiding some unecessary
             // bound checking
-            const bind_payload_len = 8 + sql.len + name.len;
+            const bind_payload_len = 8 + sql.len + name.len + 4 * declared.len;
             const describe_payload_len = 6 + name.len;
             const sync_payload_len = 4;
 
@@ -155,8 +157,11 @@ pub const Stmt = struct {
             view.write(name);
             view.writeByte(0);
             view.write(sql);
-            // null terminate sql string, and we'll be specifying 0 parameter types
-            view.write(&.{ 0, 0, 0 });
+            // null terminate sql string
+            view.writeByte(0);
+            // the types the caller declared, and the server infers the rest
+            view.writeIntBig(u16, @intCast(declared.len));
+            for (declared) |oid| view.writeIntBig(i32, oid);
 
             // DESCRIBE
             view.writeByte('D');

@@ -143,8 +143,10 @@ pub const Conn = struct {
         // must be one that its declared type takes, and for 0, text
         // ([]const u8) or a pg.Binary.
         //
-        // A statement without parameters is always run this way. Ignored
-        // when cache_name is set, since what we cache is the description.
+        // A statement without parameters is always run this way. With
+        // cache_name set, the types are still declared to the server, but
+        // the statement is described as usual, since the description is
+        // what we cache.
         param_oids: ?[]const i32 = null,
     };
 
@@ -1943,18 +1945,19 @@ test "Conn: param_oids reports an error the server finds in the statement" {
     try t.expectEqual(2, t.scalar(&c, "select 2"));
 }
 
-test "Conn: param_oids is ignored for a cached statement" {
+test "Conn: param_oids are declared for a cached statement, which is still described" {
     var c = try t.connect(.{});
     defer c.deinit();
 
     for (0..2) |_| {
-        // an i64 for an int4 is what only a described statement coerces
-        var result = try c.queryOpts("select $1::int4 + 1", .{@as(i64, 41)}, .{
+        // Undeclared, $1 is text. And an i64 for an int4 is what only a
+        // described statement coerces.
+        var result = try c.queryOpts("select $1", .{@as(i64, 41)}, .{
             .cache_name = "param_oids_cached",
-            .param_oids = &.{0},
+            .param_oids = &.{types.Int32.oid.decimal},
         });
         defer result.deinit();
-        try t.expectEqual(42, try (try result.next()).?.get(i32, 0));
+        try t.expectEqual(41, try (try result.next()).?.get(i32, 0));
         try result.drain();
     }
 }
