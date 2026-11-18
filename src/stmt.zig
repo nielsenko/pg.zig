@@ -350,7 +350,7 @@ pub const Stmt = struct {
 
         // the format (text or binary) of each parameter. We'll default to text
         // for now, and fill this in as we get the data
-        try buf.writeByteNTimes(0, param_count * 2);
+        try buf.writeByteNTimes(0, @as(usize, param_count) * 2);
 
         // number of parameters we're sending a
         try buf.writeIntBig(u16, param_count);
@@ -365,7 +365,7 @@ pub const Stmt = struct {
         // We tell PostgreSQL the format (text or binary) of each parameter. This
         // information is at the start of the message, always starts at byte 9
         // and each value is 2 bytes.
-        const format_offset = self.bind_start + 9 + (param_index * 2) + name.len;
+        const format_offset = self.bind_start + 9 + (@as(usize, param_index) * 2) + name.len;
 
         try types.bindValue(@TypeOf(value), self.param_oids[param_index], value, self.buf, format_offset);
         self.param_index = param_index + 1;

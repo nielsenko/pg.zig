@@ -1962,6 +1962,39 @@ test "Conn: param_oids are declared for a cached statement, which is still descr
     }
 }
 
+test "Stmt: as many parameters as the protocol counts" {
+    var c = try t.connect(.{});
+    defer c.deinit();
+
+    // The count is a u16 on the wire. Twice the count, which is where the
+    // values start in a Bind, is not.
+    const count = std.math.maxInt(u16);
+    var sql: std.ArrayList(u8) = .empty;
+    defer sql.deinit(t.allocator);
+    try sql.appendSlice(t.allocator, "select count(*), sum(n) from (values ");
+    for (1..count + 1) |i| {
+        if (i > 1) try sql.append(t.allocator, ',');
+        try sql.print(t.allocator, "(${d}::int4)", .{i});
+    }
+    try sql.appendSlice(t.allocator, ") as v(n)");
+
+    var stmt = try Stmt.init(&c, .{});
+    {
+        errdefer stmt.deinit();
+        try stmt.prepare(sql.items, null);
+        for (0..count) |i| try stmt.bind(@as(i32, @intCast(i % 2)));
+    }
+    var result = stmt.execute() catch |err| {
+        stmt.deinit();
+        return err;
+    };
+    defer result.deinit();
+    const row = (try result.next()).?;
+    try t.expectEqual(count, try row.get(i64, 0));
+    try t.expectEqual(count / 2, try row.get(i64, 1));
+    try result.drain();
+}
+
 test "Conn: auth_methods" {
     const cleartext = [_]u8{ 'R', 0, 0, 0, 8, 0, 0, 0, 3 };
     const md5 = [_]u8{ 'R', 0, 0, 0, 12, 0, 0, 0, 5, 1, 2, 3, 4 };
